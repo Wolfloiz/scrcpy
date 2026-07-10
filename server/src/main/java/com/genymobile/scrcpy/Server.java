@@ -7,6 +7,7 @@ import com.genymobile.scrcpy.audio.AudioEncoder;
 import com.genymobile.scrcpy.audio.AudioPlaybackCapture;
 import com.genymobile.scrcpy.audio.AudioRawRecorder;
 import com.genymobile.scrcpy.audio.AudioSource;
+import com.genymobile.scrcpy.camlink.CamLinkControlServer;
 import com.genymobile.scrcpy.control.ControlChannel;
 import com.genymobile.scrcpy.control.Controller;
 import com.genymobile.scrcpy.device.DesktopConnection;
@@ -103,6 +104,7 @@ public final class Server {
         List<AsyncProcessor> asyncProcessors = new ArrayList<>();
 
         DesktopConnection connection = DesktopConnection.open(scid, tunnelForward, video, audio, control, sendDummyByte);
+        CamLinkControlServer camLinkControlServer = null;
         try {
             if (options.getSendDeviceMeta()) {
                 connection.sendDeviceMeta(Device.getDeviceName());
@@ -149,7 +151,14 @@ public final class Server {
                         surfaceCapture = new ScreenCapture(controller, options);
                     }
                 } else {
-                    surfaceCapture = new CameraCapture(options);
+                    CameraCapture cameraCapture = new CameraCapture(options);
+                    surfaceCapture = cameraCapture;
+                    // CamLink: expose runtime camera controls on localabstract:camlink
+                    try {
+                        camLinkControlServer = CamLinkControlServer.start(cameraCapture);
+                    } catch (IOException e) {
+                        Ln.w("CamLink control server could not start: " + e.getMessage());
+                    }
                 }
                 SurfaceEncoder surfaceEncoder = new SurfaceEncoder(surfaceCapture, videoStreamer, options);
                 asyncProcessors.add(surfaceEncoder);
@@ -168,6 +177,9 @@ public final class Server {
 
             Looper.loop(); // interrupted by the Completion implementation
         } finally {
+            if (camLinkControlServer != null) {
+                camLinkControlServer.stop();
+            }
             if (cleanUp != null) {
                 cleanUp.interrupt();
             }

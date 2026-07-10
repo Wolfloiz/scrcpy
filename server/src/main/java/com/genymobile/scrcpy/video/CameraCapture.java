@@ -73,7 +73,8 @@ public class CameraCapture extends SurfaceCapture {
     private String cameraId;
     private Size captureSize;
     private Size videoSize; // after OpenGL transforms
-    private Range<Float> zoomRange;
+    // volatile: written on the camera thread, read by the CamLink control thread
+    private volatile Range<Float> zoomRange;
 
     private AffineMatrix transform;
     private OpenGLRunner glRunner;
@@ -514,6 +515,38 @@ public class CameraCapture extends SurfaceCapture {
 
     public void zoomOut() {
         zoom(false);
+    }
+
+    // --- CamLink (fork) hooks ---
+
+    /**
+     * CamLink: zoom ratio range reported by the camera, for validating set_zoom against
+     * capabilities. Null until the capture session is configured.
+     */
+    public Range<Float> getZoomRatioRange() {
+        return zoomRange;
+    }
+
+    /**
+     * CamLink: apply an absolute zoom ratio at runtime by rebuilding the repeating request,
+     * without reopening the camera. Safe to call from any thread.
+     */
+    @TargetApi(AndroidVersions.API_30_ANDROID_11)
+    public void setZoomRatio(float ratio) {
+        cameraHandler.post(() -> {
+            assertCameraThread();
+            if (currentSession != null && requestBuilder != null) {
+                try {
+                    zoom = clampZoom(ratio);
+                    Ln.i("CamLink: set camera zoom: " + zoom);
+                    requestBuilder.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom);
+                    CaptureRequest request = requestBuilder.build();
+                    setRepeatingRequest(currentSession, request);
+                } catch (CameraAccessException e) {
+                    Ln.e("Camera error", e);
+                }
+            }
+        });
     }
 
     private float clampZoom(float value) {
