@@ -552,6 +552,63 @@ public class CameraCapture extends SurfaceCapture {
         return zoomRange.clamp(value);
     }
 
+    /**
+     * CamLink: id da câmera efetivamente aberta (para montar capabilities a partir das
+     * CameraCharacteristics corretas). Null antes de init().
+     */
+    public String camlinkGetCameraId() {
+        return cameraId;
+    }
+
+    /**
+     * CamLink (T035): hook genérico de controle em runtime — muta a repeating request corrente e a
+     * reaplica via setRepeatingRequest, sem reabrir a câmera (contrato §3, efeito < 1 s). Safe de
+     * qualquer thread; no-op silencioso se a sessão ainda não subiu.
+     */
+    @TargetApi(AndroidVersions.API_31_ANDROID_12)
+    public void camlinkUpdateRequest(java.util.function.Consumer<CaptureRequest.Builder> mutator) {
+        cameraHandler.post(() -> {
+            assertCameraThread();
+            if (currentSession != null && requestBuilder != null) {
+                try {
+                    mutator.accept(requestBuilder);
+                    setRepeatingRequest(currentSession, requestBuilder.build());
+                } catch (CameraAccessException e) {
+                    Ln.e("CamLink: camera error", e);
+                }
+            }
+        });
+    }
+
+    /**
+     * CamLink (T036): dispara UMA captura com a request corrente mutada (ex.: AF_TRIGGER_START do
+     * tap-to-focus) e em seguida devolve o trigger a IDLE na repeating request para não re-disparar
+     * a cada frame. O callback observa o resultado (CONTROL_AF_STATE → evento af_state). Sessões
+     * high-speed não suportam capture única — o comando vira no-op logado.
+     */
+    @TargetApi(AndroidVersions.API_31_ANDROID_12)
+    public void camlinkCaptureOnce(
+            java.util.function.Consumer<CaptureRequest.Builder> mutator, CameraCaptureSession.CaptureCallback callback) {
+        cameraHandler.post(() -> {
+            assertCameraThread();
+            if (currentSession == null || requestBuilder == null) {
+                return;
+            }
+            if (highSpeed) {
+                Ln.w("CamLink: capture única indisponível em sessão high-speed");
+                return;
+            }
+            try {
+                mutator.accept(requestBuilder);
+                currentSession.capture(requestBuilder.build(), callback, cameraHandler);
+                requestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE);
+                setRepeatingRequest(currentSession, requestBuilder.build());
+            } catch (CameraAccessException e) {
+                Ln.e("CamLink: camera error", e);
+            }
+        });
+    }
+
     private void assertCameraThread() {
         assert Thread.currentThread() == cameraThread;
     }
