@@ -29,7 +29,9 @@ fi
 
 # Testes de contrato primeiro (golden files compartilhados com o cliente Rust);
 # CAMLINK_GOLDEN_DIR permite rodar fora do layout de submodule do CamLink.
-./gradlew :server:testReleaseUnitTest
+# Só existe task de unit test para o build type "debug" (AGP não gera
+# testReleaseUnitTest neste módulo, sem testBuildType custom).
+./gradlew :server:testDebugUnitTest
 
 ./gradlew :server:assembleRelease
 

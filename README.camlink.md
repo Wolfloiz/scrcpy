@@ -115,6 +115,24 @@ build-tools 36.0.0); servidor executado headless via `app_process` com
 - `set_zoom 999` → `OUT_OF_RANGE "zoom 999.0 out of [1.0, 8.0]"` ✓
 - comando desconhecido → `BAD_REQUEST` ✓
 
+### Resultado da validação do protocolo completo US2 — ✅ VALIDADO (2026-07-24)
+
+Jar buildado via `build-camlink.sh` (JDK 17 Temurin + platform-36 +
+build-tools 36.0.0, `./gradlew :server:testDebugUnitTest` — não existe
+`testReleaseUnitTest` neste módulo — + `:server:assembleRelease`). Validado
+headless em dois devices reais via `adb forward` + socket NDJSON direto
+(sem cliente scrcpy no meio do protocolo):
+
+- **SM-G781B (S20 FE, Android 13, Snapdragon)**: `hello`, `get_capabilities`
+  (ranges reais lidos das `CameraCharacteristics`), `set_focus`
+  (continuous/tap/manual), `set_exposure`, `set_wb`, `set_eis`, `set_torch`
+  (ligar), `set_iso` fora do modo pro → `BAD_REQUEST`, `set_zoom` fora do
+  range → `OUT_OF_RANGE`, comando desconhecido → `BAD_REQUEST` — todos OK.
+  `set_torch` (desligar) tem o quirk #4 abaixo.
+- **SM-N970F (Note 10, Android 12, Exynos 9825)**: `hello`,
+  `get_capabilities`, `set_torch` ligar/desligar (2×, sem falha) — usado
+  especificamente para isolar o quirk #4 por chipset.
+
 ### Quirks Samsung descobertos (afetam o CamLink desktop)
 
 1. **Overflow por cmdline longa**: a libstagefright da One UI tem hooks
@@ -133,6 +151,26 @@ build-tools 36.0.0); servidor executado headless via `app_process` com
    candidato a diagnóstico acionável (FR-010) no CamLink.
 3. `/data/local/tmp` pode ser limpo pelo sistema entre sessões — sempre
    re-push do jar antes de iniciar.
+4. **`set_torch` (desligar) derruba o encoder de vídeo em chipset
+   Snapdragon**: confirmado no SM-G781B (S20 FE) — ~300 ms após
+   `Turn camera torch off`, o encoder OMX Qualcomm falha
+   (`OMX-VENC: CVP metadata not available` → `ETBProxy: dev_empty_buf
+   failed` → `OMX_ErrorHardware`), o servidor loga `Capture/encoding error:
+   java.lang.IllegalStateException: null` e o stream de vídeo inteiro morre
+   (`Camera3-OutputStream: Error queueing buffer... No such device`); o
+   socket de controle continua respondendo normalmente (o problema é
+   isolado ao pipeline de vídeo, não ao `CamLinkCommandProcessor`/
+   `CamLinkCameraController`). Reproduzido 2/2 vezes. **Não reproduz** no
+   SM-N970F (Note 10, Exynos 9825) — torch ligar/desligar 2× sem qualquer
+   erro. Hipótese: interação entre `FLASH_MODE_TORCH`→`FLASH_MODE_OFF` e
+   metadados de estabilização (CVP) exigidos pelo encoder de hardware
+   Qualcomm nesta config de captura. **Limitação conhecida, não
+   corrigida**: `set_torch` (desligar) pode derrubar o stream em devices
+   Snapdragon; sem mitigação implementada. Se isso se mostrar comum nos
+   devices-alvo do CamLink, investigar reconfigurar a sessão de captura (em
+   vez de só reconstruir a repeating request) na transição de flash, ou
+   aplicar um pequeno delay/reassert de `CONTROL_AE_MODE` junto da
+   mudança.
 
 ## Rebase contra o upstream
 
