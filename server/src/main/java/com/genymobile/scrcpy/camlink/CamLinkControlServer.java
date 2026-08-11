@@ -24,7 +24,7 @@ import java.nio.charset.StandardCharsets;
  * <p>Contrato: {@code specs/001-phone-webcam-bridge/contracts/control-protocol.md} no repositório
  * CamLink, validado pelos golden files nos dois lados (ProtocolTest.java aqui, cargo test lá).
  */
-public final class CamLinkControlServer implements Runnable, CamLinkCameraController.EventSink {
+public final class CamLinkControlServer implements Runnable, CamLinkCameraController.EventSink, RawCapture.FrameSink {
 
     public static final String SOCKET_NAME = "camlink";
     public static final String SERVER_NAME = "camlink-v4.0";
@@ -37,7 +37,7 @@ public final class CamLinkControlServer implements Runnable, CamLinkCameraContro
     private volatile OutputStream clientOut;
 
     private CamLinkControlServer(CameraCapture cameraCapture) {
-        CamLinkCameraController controller = new CamLinkCameraController(cameraCapture, this);
+        CamLinkCameraController controller = new CamLinkCameraController(cameraCapture, this, this);
         this.processor = new CamLinkCommandProcessor(controller, SERVER_NAME);
         this.thread = new Thread(this, "camlink-control");
         // Daemon: never keep the server process alive on its own
@@ -112,6 +112,28 @@ public final class CamLinkControlServer implements Runnable, CamLinkCameraContro
             }
         } catch (IOException e) {
             Ln.w("CamLink event dropped: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Escreve um frame RAW já framed (contrato §4: {@code [tag][metadata_len][json][dng_len]
+     * [dng]}) direto no socket — SEM terminador de linha, é length-prefixed, não NDJSON. Usa o
+     * MESMO lock de {@link #sendEvent} pra nunca intercalar bytes de threads diferentes (a
+     * captura RAW roda na thread da câmera; eventos podem sair de qualquer thread).
+     */
+    @Override
+    public void sendRawFrame(byte[] framed) {
+        OutputStream out = clientOut;
+        if (out == null) {
+            return;
+        }
+        try {
+            synchronized (this) {
+                out.write(framed);
+                out.flush();
+            }
+        } catch (IOException e) {
+            Ln.w("CamLink raw frame dropped: " + e.getMessage());
         }
     }
 }
