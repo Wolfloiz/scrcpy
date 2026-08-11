@@ -12,6 +12,7 @@ import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.CaptureResult;
 import android.hardware.camera2.TotalCaptureResult;
+import android.hardware.camera2.params.Face;
 import android.hardware.camera2.params.MeteringRectangle;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.MediaCodec;
@@ -40,11 +41,22 @@ public final class CamLinkCameraController implements CamLinkCommandProcessor.Co
 
     private final CameraCapture capture;
     private final EventSink eventSink;
+    private final RawCapture.FrameSink frameSink;
     private JSONObject cachedCapabilities;
+    // Lazy (US5): só existe quando alguém realmente pede raw_snapshot/raw_sequence_start — a
+    // maioria das sessões nunca usa RAW, então não vale montar CameraCharacteristics à toa.
+    private volatile RawCapture rawCapture;
 
-    public CamLinkCameraController(CameraCapture capture, EventSink eventSink) {
+    // --- Face-AF (US3: auto/night) ---
+    /** Cacheado em applyMode — evita um binder call por frame no callback de face. */
+    private volatile Rect faceAfActiveArray;
+    /** Última região de AF_REGIONS aplicada por face — throttle: só reaplica quando muda. */
+    private Rect lastFaceAfRegion;
+
+    public CamLinkCameraController(CameraCapture capture, EventSink eventSink, RawCapture.FrameSink frameSink) {
         this.capture = capture;
         this.eventSink = eventSink;
+        this.frameSink = frameSink;
     }
 
     // -----------------------------------------------------------------------
@@ -155,27 +167,19 @@ public final class CamLinkCameraController implements CamLinkCommandProcessor.Co
         Boolean flash = current.get(CameraCharacteristics.FLASH_INFO_AVAILABLE);
         caps.put("supports_torch", flash != null && flash);
 
-        if (hasCapability(current, CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW)) {
-            StreamConfigurationMap configs = current.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-            android.util.Size[] rawSizes = configs != null ? configs.getOutputSizes(android.graphics.ImageFormat.RAW_SENSOR) : null;
-            if (rawSizes != null && rawSizes.length > 0) {
-                android.util.Size best = rawSizes[0];
-                for (android.util.Size s : rawSizes) {
-                    if ((long) s.getWidth() * s.getHeight() > (long) best.getWidth() * best.getHeight()) {
-                        best = s;
-                    }
-                }
-                JSONObject raw = new JSONObject();
-                JSONArray sensorSize = new JSONArray();
-                sensorSize.put(best.getWidth());
-                sensorSize.put(best.getHeight());
-                raw.put("sensor_size", sensorSize);
-                // RAW16: 2 bytes por pixel (DngCreator consome RAW_SENSOR)
-                raw.put("frame_bytes", (long) best.getWidth() * best.getHeight() * 2);
-                caps.put("raw", raw);
-            } else {
-                caps.put("raw", JSONObject.NULL);
-            }
+        // Mesma checagem que decide se a sessão ganha a superfície RAW extra
+        // (CameraCapture#camlinkBestRawSize) — fonte única de verdade, pra
+        // capabilities e superfície real nunca poderem divergir.
+        android.util.Size bestRaw = CameraCapture.camlinkBestRawSize(current);
+        if (bestRaw != null) {
+            JSONObject raw = new JSONObject();
+            JSONArray sensorSize = new JSONArray();
+            sensorSize.put(bestRaw.getWidth());
+            sensorSize.put(bestRaw.getHeight());
+            raw.put("sensor_size", sensorSize);
+            // RAW16: 2 bytes por pixel (DngCreator consome RAW_SENSOR)
+            raw.put("frame_bytes", (long) bestRaw.getWidth() * bestRaw.getHeight() * 2);
+            caps.put("raw", raw);
         } else {
             caps.put("raw", JSONObject.NULL);
         }
@@ -376,4 +380,196 @@ public final class CamLinkCameraController implements CamLinkCommandProcessor.Co
     public void applyTorch(boolean enabled) {
         capture.setTorchEnabled(enabled);
     }
+
+    // -----------------------------------------------------------------------
+    // Modos inteligentes (US3) — tabela em ModePresets, aplicada de uma vez
+    // -----------------------------------------------------------------------
+
+    @Override
+    public void applyMode(String mode) throws Exception {
+        ModePresets.Preset preset = ModePresets.forMode(mode);
+        if (preset == null) {
+            // O processor já validou contra ModePresets.forMode antes de chegar aqui.
+            throw new IllegalArgumentException("modo inválido: " + mode);
+        }
+        CameraManager manager = ServiceManager.getCameraManager();
+        CameraCharacteristics ch = manager.getCameraCharacteristics(capture.camlinkGetCameraId());
+
+        // EV inteiro do preset → steps nativos do step-size da câmera (mesma conversão de
+        // applyExposureCompensation).
+        Rational step = ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP);
+        Integer evSteps = null;
+        if (preset.evCompEv != null) {
+            evSteps = step != null && step.floatValue() > 0
+                    ? Math.round(preset.evCompEv / step.floatValue())
+                    : preset.evCompEv;
+        }
+        final Integer evStepsFinal = evSteps;
+
+        // O range da tabela é o ideal, mas nem todo aparelho declara exatamente esses valores em
+        // CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES — pedir um range fora da lista é comportamento
+        // indefinido no Camera2 (visto em bancada: AE "patina" e o fps real despenca e oscila,
+        // em vez de falhar limpo). Por isso ancora sempre no range suportado mais próximo.
+        Range<Integer> fpsRange = null;
+        if (preset.fpsMin != null) {
+            Range<Integer>[] available = ch.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+            fpsRange = closestSupportedFpsRange(available, preset.fpsMin, preset.fpsMax);
+            if (fpsRange != null && (fpsRange.getLower() != preset.fpsMin || fpsRange.getUpper() != preset.fpsMax)) {
+                Ln.w("CamLink: modo " + mode + " pediu fps " + preset.fpsMin + "-" + preset.fpsMax
+                        + ", aparelho não declara esse range; usando " + fpsRange + " (mais próximo suportado)");
+            }
+        }
+        final Range<Integer> fpsRangeFinal = fpsRange;
+
+        capture.camlinkUpdateRequest(builder -> {
+            builder.set(CaptureRequest.CONTROL_AF_MODE, preset.afMode);
+            builder.set(CaptureRequest.CONTROL_AE_MODE, preset.aeMode);
+            if (fpsRangeFinal != null) {
+                builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRangeFinal);
+            }
+            if (evStepsFinal != null) {
+                builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, evStepsFinal);
+            }
+            if (preset.awbMode != null) {
+                builder.set(CaptureRequest.CONTROL_AWB_MODE, preset.awbMode);
+            }
+            builder.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, preset.stabilizationMode);
+            builder.set(CaptureRequest.NOISE_REDUCTION_MODE, preset.noiseReductionMode);
+            builder.set(CaptureRequest.STATISTICS_FACE_DETECT_MODE,
+                    preset.faceAf
+                            ? CaptureRequest.STATISTICS_FACE_DETECT_MODE_SIMPLE
+                            : CaptureRequest.STATISTICS_FACE_DETECT_MODE_OFF);
+            if (!preset.faceAf) {
+                // Sport/Pro: sem face-AF, região de AF volta a ser tudo (comportamento
+                // default do CONTINUOUS_VIDEO/OFF).
+                builder.set(CaptureRequest.CONTROL_AF_REGIONS, null);
+            }
+        });
+
+        lastFaceAfRegion = null;
+        if (preset.faceAf) {
+            faceAfActiveArray = ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+            capture.camlinkSetCaptureListener(faceAfCallback);
+        } else {
+            capture.camlinkSetCaptureListener(null);
+        }
+    }
+
+    /**
+     * Entre os ranges de {@code CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES} do aparelho, escolhe o
+     * mais próximo do desejado (soma das distâncias absolutas de min e max). {@code null} se a
+     * câmera não declarar nenhum range (nunca visto na prática, mas a API permite).
+     */
+    private static Range<Integer> closestSupportedFpsRange(Range<Integer>[] available, int wantMin, int wantMax) {
+        if (available == null || available.length == 0) {
+            return null;
+        }
+        Range<Integer> best = available[0];
+        long bestScore = Long.MAX_VALUE;
+        for (Range<Integer> r : available) {
+            long score = Math.abs(r.getLower() - wantMin) + Math.abs(r.getUpper() - wantMax);
+            if (score < bestScore) {
+                bestScore = score;
+                best = r;
+            }
+        }
+        return best;
+    }
+
+    // -----------------------------------------------------------------------
+    // Captura RAW (US5) — delega pro RawCapture, construído sob demanda
+    // -----------------------------------------------------------------------
+
+    /**
+     * Constrói o {@link RawCapture} na primeira vez que alguém pede RAW ({@code null} se o
+     * aparelho não suportar — dispatch já bloqueou isso com UNSUPPORTED antes de chegar aqui, mas
+     * nunca custa checar de novo). Reaproveita {@code getCapabilities()} pra não duplicar a
+     * checagem de suporte nem o cálculo de {@code frame_bytes}.
+     */
+    private synchronized RawCapture ensureRawCapture() throws Exception {
+        if (rawCapture != null) {
+            return rawCapture;
+        }
+        JSONObject caps = getCapabilities();
+        if (caps.isNull("raw")) {
+            return null;
+        }
+        long frameBytes = caps.getJSONObject("raw").getLong("frame_bytes");
+        CameraManager manager = ServiceManager.getCameraManager();
+        CameraCharacteristics ch = manager.getCameraCharacteristics(capture.camlinkGetCameraId());
+        rawCapture = new RawCapture(capture, ch, frameSink, eventSink, frameBytes);
+        return rawCapture;
+    }
+
+    @Override
+    public boolean isRawBusy() throws Exception {
+        RawCapture rc = ensureRawCapture();
+        return rc != null && rc.isBusy();
+    }
+
+    @Override
+    public void rawSnapshot() throws Exception {
+        RawCapture rc = ensureRawCapture();
+        if (rc != null) {
+            rc.snapshot();
+        }
+    }
+
+    @Override
+    public double rawSequenceStart(double requestedFps) throws Exception {
+        RawCapture rc = ensureRawCapture();
+        return rc != null ? rc.sequenceStart(requestedFps) : 0;
+    }
+
+    @Override
+    public void rawSequenceStop() throws Exception {
+        RawCapture rc = ensureRawCapture();
+        if (rc != null) {
+            rc.sequenceStop();
+        }
+    }
+
+    /**
+     * Face-AF automático (auto/night): a cada frame, lê STATISTICS_FACES, emite o evento
+     * {@code faces} (contrato §5) e mira o AF na maior face detectada via CONTROL_AF_REGIONS —
+     * só reaplica a request quando a região muda (evita reconfigurar a sessão a cada frame com
+     * uma face parada).
+     */
+    private final CameraCaptureSession.CaptureCallback faceAfCallback = new CameraCaptureSession.CaptureCallback() {
+        @Override
+        public void onCaptureCompleted(CameraCaptureSession session, CaptureRequest request, TotalCaptureResult result) {
+            Rect activeArray = faceAfActiveArray;
+            Face[] faces = result.get(CaptureResult.STATISTICS_FACES);
+            JSONArray rects = new JSONArray();
+            Rect bestFace = null;
+            if (faces != null && activeArray != null) {
+                for (Face face : faces) {
+                    Rect bounds = face.getBounds();
+                    try {
+                        JSONObject rect = new JSONObject();
+                        rect.put("x", (bounds.left - activeArray.left) / (double) activeArray.width());
+                        rect.put("y", (bounds.top - activeArray.top) / (double) activeArray.height());
+                        rect.put("w", bounds.width() / (double) activeArray.width());
+                        rect.put("h", bounds.height() / (double) activeArray.height());
+                        rects.put(rect);
+                    } catch (JSONException e) {
+                        // ignora essa face, segue com as outras
+                    }
+                    if (bestFace == null || (long) bounds.width() * bounds.height() > (long) bestFace.width() * bestFace.height()) {
+                        bestFace = bounds;
+                    }
+                }
+            }
+            eventSink.sendEvent(CamLinkCommandProcessor.eventFaces(rects));
+
+            if (bestFace != null && !bestFace.equals(lastFaceAfRegion)) {
+                lastFaceAfRegion = bestFace;
+                MeteringRectangle[] regions = {new MeteringRectangle(bestFace, MeteringRectangle.METERING_WEIGHT_MAX)};
+                capture.camlinkUpdateRequest(builder -> builder.set(CaptureRequest.CONTROL_AF_REGIONS, regions));
+            } else if (bestFace == null && lastFaceAfRegion != null) {
+                lastFaceAfRegion = null;
+                capture.camlinkUpdateRequest(builder -> builder.set(CaptureRequest.CONTROL_AF_REGIONS, null));
+            }
+        }
+    };
 }

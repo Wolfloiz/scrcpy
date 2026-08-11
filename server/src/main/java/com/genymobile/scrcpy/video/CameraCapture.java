@@ -25,9 +25,12 @@ import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureFailure;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.TotalCaptureResult;
 import android.hardware.camera2.params.OutputConfiguration;
 import android.hardware.camera2.params.SessionConfiguration;
 import android.hardware.camera2.params.StreamConfigurationMap;
+import android.graphics.ImageFormat;
+import android.media.ImageReader;
 import android.media.MediaCodec;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -35,8 +38,8 @@ import android.util.Range;
 import android.view.Surface;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -90,6 +93,25 @@ public class CameraCapture extends SurfaceCapture {
     private boolean started;
     private CaptureRequest.Builder requestBuilder;
     private CameraCaptureSession currentSession;
+
+    /**
+     * CamLink (US5): {@code ImageReader} extra da sessão pra Captura RAW, criado em {@link
+     * #start} SOMENTE quando o aparelho declara {@code REQUEST_AVAILABLE_CAPABILITIES_RAW} (ver
+     * {@link #camlinkBestRawSize}) — {@code null} em qualquer aparelho sem RAW, sem nenhuma
+     * mudança de comportamento pra eles. Volatile: escrito por {@code start()} (thread do
+     * encoder), lido pela thread de controle via {@link #camlinkGetRawReader}.
+     */
+    private volatile ImageReader camlinkRawReader;
+
+    /**
+     * CamLink (US3): listener opcional de {@code onCaptureCompleted} da repeating request
+     * corrente (face-AF). {@code volatile} porque é setado por
+     * {@link #camlinkSetCaptureListener} (thread de controle) e lido no callback interno de
+     * {@link #setRepeatingRequest} (thread da câmera) — sem precisar reaplicar a request: o
+     * callback interno é sempre o mesmo objeto e sempre delega, então trocar o listener pega
+     * efeito no próximo frame, mesmo que outro comando (zoom, foco) reaplique a request no meio.
+     */
+    private volatile CameraCaptureSession.CaptureCallback camlinkCompletedListener;
 
     public CameraCapture(Options options) {
         this.explicitCameraId = options.getCameraId();
@@ -292,7 +314,27 @@ public class CameraCapture extends SurfaceCapture {
 
         Surface captureSurface = surface;
         OutputConfiguration outputConfig = new OutputConfiguration(captureSurface);
-        List<OutputConfiguration> outputs = Collections.singletonList(outputConfig);
+        List<OutputConfiguration> outputs = new ArrayList<>();
+        outputs.add(outputConfig);
+
+        // CamLink (US5): superfície extra pra Captura RAW (contracts/control-protocol.md §4) —
+        // aditivo e condicional: só existe quando o aparelho declara RAW_SENSOR e a sessão não é
+        // high-speed (sessões high-speed do Camera2 só aceitam as superfícies de vídeo, não uma
+        // superfície RAW arbitrária). Sem RAW, `outputs` fica idêntico ao scrcpy puro.
+        if (!highSpeed) {
+            try {
+                CameraCharacteristics ch = ServiceManager.getCameraManager().getCameraCharacteristics(cameraId);
+                android.util.Size rawSize = camlinkBestRawSize(ch);
+                if (rawSize != null) {
+                    ImageReader reader = ImageReader.newInstance(rawSize.getWidth(), rawSize.getHeight(), ImageFormat.RAW_SENSOR, 2);
+                    camlinkRawReader = reader;
+                    outputs.add(new OutputConfiguration(reader.getSurface()));
+                }
+            } catch (CameraAccessException e) {
+                Ln.w("CamLink: não consegui checar suporte a RAW: " + e.getMessage());
+            }
+        }
+
         int sessionType = highSpeed ? SessionConfiguration.SESSION_HIGH_SPEED : SessionConfiguration.SESSION_REGULAR;
         SessionConfiguration sessionConfig = new SessionConfiguration(sessionType, outputs, cameraExecutor, new CameraCaptureSession.StateCallback() {
             @Override
@@ -454,6 +496,16 @@ public class CameraCapture extends SurfaceCapture {
             public void onCaptureFailed(CameraCaptureSession session, CaptureRequest request, CaptureFailure failure) {
                 Ln.w("Camera capture failed: frame " + failure.getFrameNumber());
             }
+
+            @Override
+            public void onCaptureCompleted(CameraCaptureSession session, CaptureRequest request, TotalCaptureResult result) {
+                // CamLink (US3): delega pro listener corrente (face-AF), se algum estiver
+                // registrado — ver camlinkSetCaptureListener.
+                CameraCaptureSession.CaptureCallback listener = camlinkCompletedListener;
+                if (listener != null) {
+                    listener.onCaptureCompleted(session, request, result);
+                }
+            }
         };
 
         if (highSpeed) {
@@ -567,6 +619,18 @@ public class CameraCapture extends SurfaceCapture {
     }
 
     /**
+     * CamLink (US3): registra (ou remove, com {@code null}) um listener de
+     * {@code onCaptureCompleted} da repeating request corrente — usado pra face-AF
+     * (STATISTICS_FACES a cada frame). Não precisa reaplicar a request nem tocar a thread da
+     * câmera: o callback interno de {@link #setRepeatingRequest} já é sempre instalado e sempre
+     * delega pro listener corrente (campo volatile), então trocar aqui pega efeito no próximo
+     * frame, mesmo com outro comando (zoom, foco) reaplicando a request no meio.
+     */
+    public void camlinkSetCaptureListener(CameraCaptureSession.CaptureCallback listener) {
+        camlinkCompletedListener = listener;
+    }
+
+    /**
      * CamLink (T035): hook genérico de controle em runtime — muta a repeating request corrente e a
      * reaplica via setRepeatingRequest, sem reabrir a câmera (contrato §3, efeito < 1 s). Safe de
      * qualquer thread; no-op silencioso se a sessão ainda não subiu.
@@ -613,6 +677,87 @@ public class CameraCapture extends SurfaceCapture {
                 Ln.e("CamLink: camera error", e);
             }
         });
+    }
+
+    /**
+     * CamLink (US5): maior tamanho RAW_SENSOR suportado pela câmera, ou {@code null} se o
+     * aparelho não declarar {@code REQUEST_AVAILABLE_CAPABILITIES_RAW} nem expuser nenhum
+     * tamanho RAW_SENSOR. Única fonte de verdade dessa checagem — usada tanto aqui (criação da
+     * superfície) quanto em {@code CamLinkCameraController#buildCapabilities} (o que a UI vê),
+     * pra elas nunca poderem divergir.
+     */
+    public static android.util.Size camlinkBestRawSize(CameraCharacteristics ch) {
+        int[] capabilities = ch.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES);
+        boolean hasRaw = false;
+        if (capabilities != null) {
+            for (int c : capabilities) {
+                if (c == CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW) {
+                    hasRaw = true;
+                    break;
+                }
+            }
+        }
+        if (!hasRaw) {
+            return null;
+        }
+        StreamConfigurationMap configs = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+        android.util.Size[] sizes = configs != null ? configs.getOutputSizes(ImageFormat.RAW_SENSOR) : null;
+        if (sizes == null || sizes.length == 0) {
+            return null;
+        }
+        android.util.Size best = sizes[0];
+        for (android.util.Size s : sizes) {
+            if ((long) s.getWidth() * s.getHeight() > (long) best.getWidth() * best.getHeight()) {
+                best = s;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * CamLink (US5): {@code ImageReader} da superfície RAW extra desta sessão, ou {@code null}
+     * se o aparelho não suporta RAW (ver {@link #camlinkBestRawSize}) ou a sessão ainda não
+     * subiu. {@link RawCapture} usa isso pra registrar o listener de imagem disponível e ler os
+     * frames capturados.
+     */
+    public ImageReader camlinkGetRawReader() {
+        return camlinkRawReader;
+    }
+
+    /**
+     * CamLink (US5): dispara UMA captura independente da repeating request de vídeo, mirando
+     * SÓ a superfície informada (ex.: o {@link ImageReader} RAW) — usado pra Snapshot e cada
+     * frame da Sequência RAW. Sessões high-speed não suportam capture única (mesma limitação de
+     * {@link #camlinkCaptureOnce}).
+     */
+    @TargetApi(AndroidVersions.API_31_ANDROID_12)
+    public void camlinkCaptureToSurface(Surface targetSurface, CameraCaptureSession.CaptureCallback callback) {
+        cameraHandler.post(() -> {
+            assertCameraThread();
+            if (currentSession == null || cameraDevice == null) {
+                return;
+            }
+            if (highSpeed) {
+                Ln.w("CamLink: captura RAW indisponível em sessão high-speed");
+                return;
+            }
+            try {
+                CaptureRequest.Builder builder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
+                builder.addTarget(targetSurface);
+                currentSession.capture(builder.build(), callback, cameraHandler);
+            } catch (CameraAccessException e) {
+                Ln.e("CamLink: camera error (raw capture)", e);
+            }
+        });
+    }
+
+    /**
+     * CamLink (US5): handler da thread da câmera, pra {@link RawCapture} registrar o listener do
+     * {@code ImageReader} no mesmo thread que já processa todo o resto (evita mais uma thread e
+     * qualquer necessidade de sincronização extra entre elas).
+     */
+    public Handler camlinkGetCameraHandler() {
+        return cameraHandler;
     }
 
     private void assertCameraThread() {

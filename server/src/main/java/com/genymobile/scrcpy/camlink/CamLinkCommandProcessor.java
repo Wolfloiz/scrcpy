@@ -39,11 +39,26 @@ public final class CamLinkCommandProcessor {
         void applyEis(boolean enabled) throws Exception;
 
         void applyTorch(boolean enabled) throws Exception;
+
+        /** {@code mode} já validado contra {@link ModePresets#forMode} antes de chegar aqui. */
+        void applyMode(String mode) throws Exception;
+
+        /** US5: há uma Captura RAW (Snapshot ou Sequência) em andamento nesta sessão. */
+        boolean isRawBusy() throws Exception;
+
+        /** US5: dispara um Snapshot RAW; o frame chega pelo framing binário (contrato §4), não pela resposta deste comando. */
+        void rawSnapshot() throws Exception;
+
+        /** US5: inicia a Sequência RAW. @return fps efetivamente concedida (contrato §4, {@code granted_fps}). */
+        double rawSequenceStart(double requestedFps) throws Exception;
+
+        /** US5: encerra a Sequência RAW ativa (idempotente). */
+        void rawSequenceStop() throws Exception;
     }
 
     private final Controller controller;
     private final String serverName;
-    // Modo corrente (US3 set_mode; aqui só gateia set_iso — exige "pro")
+    // Modo corrente (US3): atualizado por handleSetMode; também gateia set_iso (exige "pro").
     private volatile String mode = "auto";
 
     public CamLinkCommandProcessor(Controller controller, String serverName) {
@@ -79,6 +94,8 @@ public final class CamLinkCommandProcessor {
                 return hello();
             case "get_capabilities":
                 return ok(controller.getCapabilities());
+            case "set_mode":
+                return handleSetMode(request);
             case "set_zoom":
                 return setZoom(request);
             case "set_focus":
@@ -93,6 +110,13 @@ public final class CamLinkCommandProcessor {
                 return setEis(request);
             case "set_torch":
                 return setTorch(request);
+            case "raw_snapshot":
+                return rawSnapshot();
+            case "raw_sequence_start":
+                return rawSequenceStart(request);
+            case "raw_sequence_stop":
+                controller.rawSequenceStop();
+                return ok(new JSONObject());
             default:
                 return error("BAD_REQUEST", "comando desconhecido: " + cmd);
         }
@@ -104,6 +128,21 @@ public final class CamLinkCommandProcessor {
         response.put("protocol", PROTOCOL_VERSION);
         response.put("server", serverName);
         return response.toString();
+    }
+
+    private String handleSetMode(JSONObject request) throws Exception {
+        if (!request.has("mode")) {
+            return error("BAD_REQUEST", "campo obrigatório ausente: mode");
+        }
+        String requestedMode = request.getString("mode");
+        if (ModePresets.forMode(requestedMode) == null) {
+            return error("BAD_REQUEST", "modo inválido: " + requestedMode);
+        }
+        controller.applyMode(requestedMode);
+        setMode(requestedMode);
+        JSONObject data = new JSONObject();
+        data.put("mode", requestedMode);
+        return ok(data);
     }
 
     private String setZoom(JSONObject request) throws Exception {
@@ -250,6 +289,34 @@ public final class CamLinkCommandProcessor {
         controller.applyTorch(enabled);
         JSONObject data = new JSONObject();
         data.put("enabled", enabled);
+        return ok(data);
+    }
+
+    private String rawSnapshot() throws Exception {
+        if (!controller.getCapabilities().has("raw") || controller.getCapabilities().isNull("raw")) {
+            return error("UNSUPPORTED", "captura RAW não suportada neste aparelho");
+        }
+        if (controller.isRawBusy()) {
+            return error("BUSY", "já existe uma captura RAW em andamento");
+        }
+        controller.rawSnapshot();
+        return ok(new JSONObject());
+    }
+
+    private String rawSequenceStart(JSONObject request) throws Exception {
+        if (!request.has("fps")) {
+            return error("BAD_REQUEST", "campo obrigatório ausente: fps");
+        }
+        if (!controller.getCapabilities().has("raw") || controller.getCapabilities().isNull("raw")) {
+            return error("UNSUPPORTED", "captura RAW não suportada neste aparelho");
+        }
+        if (controller.isRawBusy()) {
+            return error("BUSY", "já existe uma captura RAW em andamento");
+        }
+        double requestedFps = request.getDouble("fps");
+        double grantedFps = controller.rawSequenceStart(requestedFps);
+        JSONObject data = new JSONObject();
+        data.put("granted_fps", grantedFps);
         return ok(data);
     }
 

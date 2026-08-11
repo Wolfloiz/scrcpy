@@ -61,6 +61,8 @@ public final class ProtocolTest {
     private static final class FakeController implements CamLinkCommandProcessor.Controller {
         private final JSONObject capabilities;
         final List<String> applied = new ArrayList<>();
+        /** Controlável pelo teste, pra simular um job RAW já em andamento (cenário BUSY). */
+        boolean rawBusy = false;
 
         FakeController(JSONObject capabilities) {
             this.capabilities = capabilities;
@@ -114,6 +116,32 @@ public final class ProtocolTest {
         @Override
         public void applyTorch(boolean enabled) {
             applied.add("torch=" + enabled);
+        }
+
+        @Override
+        public void applyMode(String mode) {
+            applied.add("mode=" + mode);
+        }
+
+        @Override
+        public boolean isRawBusy() {
+            return rawBusy;
+        }
+
+        @Override
+        public void rawSnapshot() {
+            applied.add("raw_snapshot");
+        }
+
+        @Override
+        public double rawSequenceStart(double requestedFps) {
+            applied.add("raw_sequence_start=" + requestedFps);
+            return Math.min(requestedFps, 3.0);
+        }
+
+        @Override
+        public void rawSequenceStop() {
+            applied.add("raw_sequence_stop");
         }
     }
 
@@ -234,6 +262,39 @@ public final class ProtocolTest {
         Assert.assertTrue(
                 "comandos rejeitados não podem chegar à câmera: " + controller.applied,
                 controller.applied.isEmpty());
+    }
+
+    @Test
+    public void rawCommandsAreRejectedWithBusyWhileAJobIsActive() throws IOException, JSONException {
+        // BUSY depende de estado entre dois comandos (job já em andamento) — não cabe no formato
+        // golden-file de request único, por isso é um teste dedicado (contracts/control-protocol.md §4).
+        JSONObject caps = fixture("full");
+        FakeController controller = new FakeController(caps);
+        CamLinkCommandProcessor processor = new CamLinkCommandProcessor(controller, SERVER_NAME);
+
+        JSONObject firstReply = new JSONObject(processor.process("{\"cmd\":\"raw_snapshot\"}"));
+        Assert.assertTrue("primeiro snapshot deveria ter sucesso", firstReply.getBoolean("ok"));
+
+        controller.rawBusy = true;
+        JSONObject secondReply = new JSONObject(processor.process("{\"cmd\":\"raw_snapshot\"}"));
+        Assert.assertFalse(secondReply.getBoolean("ok"));
+        Assert.assertEquals("BUSY", secondReply.getJSONObject("error").getString("code"));
+
+        JSONObject sequenceReply = new JSONObject(processor.process("{\"cmd\":\"raw_sequence_start\",\"fps\":3}"));
+        Assert.assertFalse(sequenceReply.getBoolean("ok"));
+        Assert.assertEquals("BUSY", sequenceReply.getJSONObject("error").getString("code"));
+    }
+
+    @Test
+    public void rawSequenceStartGrantsAtMostTheSustainableFps() throws IOException, JSONException {
+        JSONObject caps = fixture("full");
+        FakeController controller = new FakeController(caps);
+        CamLinkCommandProcessor processor = new CamLinkCommandProcessor(controller, SERVER_NAME);
+
+        // FakeController simula banda que só sustenta o teto de 3 fps mesmo pedindo mais.
+        JSONObject reply = new JSONObject(processor.process("{\"cmd\":\"raw_sequence_start\",\"fps\":10}"));
+        Assert.assertTrue(reply.getBoolean("ok"));
+        Assert.assertEquals(3.0, reply.getJSONObject("data").getDouble("granted_fps"), 0.001);
     }
 
     @Test
