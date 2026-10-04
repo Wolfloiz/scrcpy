@@ -70,7 +70,10 @@ nas fases US2/US3/US5 do CamLink, sempre sobre esta mesma thread.
 ### Validação do Spike A (roteiro)
 
 Requisitos: JDK 17 + Android SDK (build), celular Android 12+ com depuração
-USB autorizada, scrcpy ≥ 4.0 e ffmpeg no PC.
+USB autorizada, ffmpeg e o cliente scrcpy **na mesma versão desta branch** no
+PC (`versionName` em `server/build.gradle`). Não é um piso de versão: o
+scrcpy aborta com `The server version (X) does not match the client (Y)` se
+as duas divergirem.
 
 ```bash
 # 1. Buildar o jar do fork (Opção A ou B acima)
