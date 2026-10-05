@@ -1,5 +1,6 @@
 package com.genymobile.scrcpy.camlink;
 
+import com.genymobile.scrcpy.BuildConfig;
 import com.genymobile.scrcpy.util.Ln;
 import com.genymobile.scrcpy.video.CameraCapture;
 
@@ -27,7 +28,18 @@ import java.nio.charset.StandardCharsets;
 public final class CamLinkControlServer implements Runnable, CamLinkCameraController.EventSink, RawCapture.FrameSink {
 
     public static final String SOCKET_NAME = "camlink";
-    public static final String SERVER_NAME = "camlink-v4.0";
+
+    /**
+     * Identificação enviada no `hello`. Derivada do BuildConfig de propósito:
+     * era a constante "camlink-v4.0" escrita à mão, e depois do rebase para a
+     * v4.1 ela passou a ANUNCIAR UMA VERSÃO QUE NÃO ERA A DO JAR. Nada valida
+     * essa string (o cliente só confere o campo `protocol`), mas ela aparece
+     * no log do CamLink — e, ao depurar um problema real de versão em bancada
+     * (2026-10-05), mandou quem investigava para a pista errada por horas.
+     *
+     * Computada, ela não tem como divergir do jar que está rodando.
+     */
+    public static final String SERVER_NAME = "camlink-v" + BuildConfig.VERSION_NAME;
 
     private final CamLinkCommandProcessor processor;
     private final Thread thread;

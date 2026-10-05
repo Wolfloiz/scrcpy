@@ -31,7 +31,11 @@ import java.util.Objects;
  */
 public final class ProtocolTest {
 
-    private static final String SERVER_NAME = "camlink-v4.0";
+    // Fixture, NÃO a identificação de produção (que vem do BuildConfig em
+    // CamLinkControlServer). Sintético de propósito: um número de versão
+    // aqui seria lido como afirmação sobre o jar e envelheceria a cada
+    // rebase. O cliente Rust só confere o prefixo "camlink-".
+    private static final String SERVER_NAME = "camlink-vTEST";
 
     private File goldenDir;
 
